@@ -1,0 +1,61 @@
+# Define the path to the CSV file
+$csvPath = "C:\lab\Terminations\UPNsForAccessRemoval.csv"
+
+# The CSV should be named MailboxRemoval.csv and be stored in the location above. The users whose access will be removed should
+# have their UPN stored in a column titled UPN.
+# Import the CSV and retrieve the UPNs
+$upnList = Import-Csv -Path $csvPath | Select-Object -ExpandProperty UPN
+
+# Get the current date in the desired format (YYYY-MM-DD)
+$date = Get-Date -Format "yyyy-MM-dd"
+
+# Create the log file in the 'outputs' directory, including the date in the filename
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$outputsDir = Join-Path $scriptDir "outputs"
+if (-not (Test-Path $outputsDir)) {
+    New-Item -Path $outputsDir -ItemType Directory | Out-Null
+}
+$logFile = Join-Path $outputsDir "MailboxRemovalLog-$date.txt"
+
+# Start logging
+Start-Transcript -Path $logFile -Append
+
+# Connect to Exchange Online if not already connected
+Connect-ExchangeOnline
+
+# Get all shared mailboxes with @lcsc.edu domain
+$sharedMailboxes = Get-Mailbox -ResultSize Unlimited | Where-Object { $_.PrimarySmtpAddress -like "*@lcsc.edu" }
+
+foreach ($userUPN in $upnList) {
+    foreach ($mailbox in $sharedMailboxes) {
+        # Check if the user has FullAccess permission
+        $fullAccess = Get-MailboxPermission -Identity $mailbox.Alias | Where-Object { $_.User -eq $userUPN }
+        foreach ($permission in $fullAccess) {
+            Remove-MailboxPermission -Identity $mailbox.Alias -User $userUPN -AccessRights FullAccess -Confirm:$false
+            Write-Host "Removed FullAccess from $mailbox.Alias for $userUPN"
+        }
+        
+        # Check if the user has SendAs permission
+        $sendAs = Get-RecipientPermission -Identity $mailbox.Alias | Where-Object { $_.Trustee -eq $userUPN }
+        foreach ($permission in $sendAs) {
+            Remove-RecipientPermission -Identity $mailbox.Alias -Trustee $userUPN -AccessRights SendAs -Confirm:$false
+            Write-Host "Removed SendAs from $mailbox.Alias for $userUPN"
+        }
+
+        # Check if the user has "Send on Behalf of" permission
+        $sendOnBehalfOf = Get-Mailbox $mailbox.Alias | Select-Object -ExpandProperty GrantSendOnBehalfTo | Where-Object { $_.PrimarySmtpAddress -eq $userUPN }
+        if ($sendOnBehalfOf) {
+            Set-Mailbox $mailbox.Alias -GrantSendOnBehalfTo @{Remove="$userUPN"}
+            Write-Host "Removed 'Send on Behalf of' from $mailbox.Alias for $userUPN"
+        }
+    }
+}
+
+# Disconnect from Exchange Online when done
+Disconnect-ExchangeOnline -Confirm:$false
+
+# Stop logging
+Stop-Transcript
+
+# Inform the user where the log is located
+Write-Host "Log file has been saved to: $logFile"
