@@ -1,0 +1,81 @@
+# Get the directory where the script is located
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# Define the path to the input CSV file, assuming it's in the same directory as the script
+$csvPath = Join-Path $scriptDir "AccessRemoval.csv"
+
+# Define the path for the output directory and ensure it exists
+$outputDir = Join-Path $scriptDir "outputs"
+if (-not (Test-Path $outputDir)) {
+    New-Item -ItemType Directory -Path $outputDir
+}
+
+# Define the path for the transcript file
+$transcriptPath = Join-Path $outputDir ("LocalADTranscription_" + (Get-Date -Format "yyyy-MM-dd") + ".txt")
+
+# Start the transcript
+Start-Transcript -Path $transcriptPath -Append
+
+# Define the base Disabled Users OU path
+$baseDisabledOU = "OU=Disabled Users,DC=lcsc,DC=edu"
+
+# Import the CSV file
+$users = Import-Csv -Path $csvPath
+
+# Get the nested OUs under the base Disabled Users OU and sort them by date (furthest in the future)
+$nestedOUs = Get-ADOrganizationalUnit -Filter * -SearchBase $baseDisabledOU |
+    Where-Object { $_.Name -match 'Delete (\d{2}-\d{2}-\d{2})' } |
+    Sort-Object {
+        [datetime]::ParseExact(($_.Name -match '(\d{2}-\d{2}-\d{2})')[0], 'MM-dd-yy', $null)
+    } -Descending
+
+# Select the nested OU with the latest date
+$targetOU = $nestedOUs | Select-Object -First 1
+
+if ($targetOU) {
+    Write-Host "Moving users to the target OU: $($targetOU.DistinguishedName)"
+
+    # Iterate over each user in the CSV
+    foreach ($user in $users) {
+        # Retrieve and pad the employee ID from the current CSV row
+        $employeeID = $user.'EmployeeID'.PadLeft(7, '0')
+
+        # Get the AD user object based on employeeID
+        $adUser = Get-ADUser -Filter "employeeID -eq '$employeeID'" -Properties MemberOf, Enabled
+
+        # Check if the user exists and is disabled
+        if ($adUser -and -not $adUser.Enabled) {
+            Write-Host "Processing disabled user: $($adUser.SamAccountName)"
+
+            # Get all group memberships for the user, excluding 'Domain Users'
+            $groupsToRemove = $adUser.MemberOf | Where-Object { $_ -notlike '*Domain Users*' }
+
+            # Iterate over each group and remove the user
+            foreach ($groupDN in $groupsToRemove) {
+                try {
+                    Remove-ADGroupMember -Identity $groupDN -Members $adUser -Confirm:$false
+                    Write-Host "Removed $($adUser.SamAccountName) from group $groupDN"
+                } catch {
+                    Write-Warning "Failed to remove user: $($adUser.SamAccountName)"
+                }
+            }
+
+            # Move the user to the target OU
+            try {
+                Move-ADObject -Identity $adUser.DistinguishedName -TargetPath $targetOU.DistinguishedName
+                Write-Host "Moved $($adUser.SamAccountName) to $($targetOU.DistinguishedName)"
+            } catch {
+                Write-Warning "Failed to move user: $($adUser.SamAccountName)"
+            }
+        } else {
+            Write-Warning "User with Employee ID $employeeID not found or is not disabled."
+        }
+    }
+} else {
+    Write-Warning "No target nested OU found with a deletion date."
+}
+
+Write-Host "User group removal and relocation process completed."
+
+# Stop the transcript
+Stop-Transcript
